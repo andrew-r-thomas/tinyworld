@@ -1,9 +1,10 @@
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     usize,
 };
 
+use itertools::Itertools;
 use rand::{rngs::ThreadRng, Rng};
 use uuid::Uuid;
 
@@ -31,6 +32,11 @@ pub struct HNSW {
     connections: Vec<HashMap<Uuid, Vec<(Uuid, f32)>>>,
 }
 
+enum Query<'q> {
+    Id(Uuid),
+    Data(&'q [f32]),
+}
+
 impl HNSW {
     pub fn new(fixed_params: FixedParams, dist_calc: RefCell<Box<dyn DistanceCalculator>>) -> Self {
         let rng = rand::thread_rng();
@@ -41,6 +47,22 @@ impl HNSW {
             dist_calc,
             embeddings: HashMap::new(),
             connections: vec![],
+        }
+    }
+
+    // TODO: figure out best place for ef
+    pub fn search(&self, query: &[f32], top_k: usize, ef: usize) -> Vec<(Uuid, f32)> {
+        match self.entry {
+            Some((mut entry_id, entry_level)) => {
+                for level in (1..=entry_level).rev() {
+                    entry_id = self.search_layer(Query::Data(query), entry_id, 1, level)[0].0;
+                }
+
+                let mut out = self.search_layer(Query::Data(query), entry_id, ef, 0);
+                out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                out.get(0..top_k).unwrap().to_vec()
+            }
+            None => vec![],
         }
     }
 
@@ -65,13 +87,14 @@ impl HNSW {
 
             // find entry for new level
             for level in (new_level + 1..=entry_point.1).rev() {
-                entry_point_id = self.search_layer(new_emb_id, entry_point_id, 1, level)[0].0;
+                entry_point_id =
+                    self.search_layer(Query::Id(new_emb_id), entry_point_id, 1, level)[0].0;
             }
 
             // insert node at each level for the rest of the way down
             for level in (0..=new_level).rev() {
                 let top_ef_construction = self.search_layer(
-                    new_emb_id,
+                    Query::Id(new_emb_id),
                     entry_point_id,
                     self.fixed_params.ef_construction as usize,
                     level,
@@ -143,14 +166,23 @@ impl HNSW {
         Ok(())
     }
 
-    fn search_layer(&self, query: Uuid, entry: Uuid, top_k: usize, level: u32) -> Vec<(Uuid, f32)> {
+    fn search_layer(
+        &self,
+        query: Query,
+        entry: Uuid,
+        top_k: usize,
+        level: u32,
+    ) -> Vec<(Uuid, f32)> {
         let mut candidates = HashMap::new();
         let mut found = HashMap::new();
         let mut visited = HashMap::new();
 
         let mut dist_calculator = self.dist_calc.borrow_mut();
 
-        let query_data = self.embeddings.get(&query).unwrap();
+        let query_data = match query {
+            Query::Id(id) => self.embeddings.get(&id).unwrap(),
+            Query::Data(data) => data,
+        };
 
         {
             let entry_data = self.embeddings.get(&entry).unwrap();
